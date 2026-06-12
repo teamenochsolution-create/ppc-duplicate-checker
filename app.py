@@ -277,36 +277,220 @@ def render_duplicate_tab(df_raw: pd.DataFrame):
                        "grouping_suggestion.csv", "text/csv")
 
 
+
 # ─────────────────────────────────────────────
-# 6. 단독 실행용: 파일 업로드 → 분석 (이 파일 하나로 완결)
+# 6. 최적화 시트 (입찰가 자동 제안 + 재업로드용 벌크시트 생성)
+# ─────────────────────────────────────────────
+def render_optimizer_tab(df_raw: pd.DataFrame, raw_original: pd.DataFrame):
+    st.header("⚙️ 최적화 시트")
+    st.caption("목표 ACOS 기준으로 키워드별 입찰가 조정안을 계산합니다. 벌크파일을 올렸다면 콘솔에 그대로 재업로드 가능한 시트까지 생성합니다.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        target_acos = st.number_input("목표 ACOS (%)", 5, 200, 30, step=5) / 100
+    with c2:
+        min_clicks_pause = st.number_input("일시중지 기준 최소 클릭수 (매출 0일 때)", 3, 50, 10)
+    with c3:
+        max_change = st.number_input("입찰 변경 상한 (±%)", 10, 100, 50, step=10) / 100
+
+    df = prepare(df_raw)
+    if df.empty:
+        st.warning("키워드 데이터를 찾지 못했습니다.")
+        return
+
+    df["cpc"] = df.apply(lambda r: r["spend"] / r["clicks"] if r["clicks"] > 0 else None, axis=1)
+
+    def decide(r):
+        # 1) 매출 0 + 클릭 충분 → 일시중지
+        if r["sales"] == 0 and r["clicks"] >= min_clicks_pause:
+            return pd.Series(["⏸️ 일시중지", None, f"클릭 {int(r['clicks'])}회 매출 $0"])
+        # 2) 데이터 부족 → 유지
+        if r["clicks"] < min_clicks_pause and r["sales"] == 0:
+            return pd.Series(["⏳ 유지 (데이터 부족)", None, f"클릭 {int(r['clicks'])}회 — 판단 보류"])
+        # 3) 매출 있음 → 목표 ACOS 역산 입찰
+        if r["sales"] > 0 and r["cpc"]:
+            ideal = r["cpc"] * (target_acos / r["acos"])           # CPC × (목표/실제)
+            lo, hi = r["cpc"] * (1 - max_change), r["cpc"] * (1 + max_change)
+            new_bid = round(max(0.10, min(max(ideal, lo), hi)), 2)
+            if r["acos"] > target_acos * 1.1:
+                return pd.Series([f"🔽 입찰 인하 → ${new_bid}", new_bid,
+                                  f"ACOS {r['acos']*100:.0f}% > 목표 {target_acos*100:.0f}%"])
+            if r["acos"] < target_acos * 0.7:
+                return pd.Series([f"🔼 입찰 인상 → ${new_bid}", new_bid,
+                                  f"ACOS {r['acos']*100:.0f}% — 노출 확대 여력"])
+            return pd.Series(["✅ 유지 (목표 범위)", None,
+                              f"ACOS {r['acos']*100:.0f}%"])
+        return pd.Series(["✅ 유지", None, ""])
+
+    df[["조치", "제안입찰가", "근거"]] = df.apply(decide, axis=1)
+
+    summary = df["조치"].str.split(" ").str[0].value_counts()
+    st.write(" | ".join(f"{k} {v}건" for k, v in summary.items()))
+
+    show = df[df["조치"].str.contains("인하|인상|일시중지")].sort_values("spend", ascending=False)
+    st.dataframe(show[["campaign", "ad_group", "kw_norm", "match_norm", "clicks",
+                       "spend", "sales", "acos", "cpc", "조치", "제안입찰가", "근거"]],
+                 use_container_width=True)
+    st.download_button("최적화 시트 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                       "optimizer.csv", "text/csv")
+
+    # ── 벌크파일이면 재업로드용 시트 생성 (Keyword ID 기반)
+    cols_lower = {c.lower(): c for c in raw_original.columns}
+    if "keyword id" in cols_lower and "entity" in cols_lower:
+        st.subheader("📤 아마존 재업로드용 벌크시트")
+        bulk = raw_original.copy()
+        ent = cols_lower["entity"]
+        kwt = cols_lower.get("keyword text")
+        mt = cols_lower.get("match type")
+        kw_rows = bulk[bulk[ent].astype(str).str.lower() == "keyword"].copy()
+        kw_rows["_k"] = kw_rows[kwt].map(normalize_kw) + "|" + kw_rows[mt].map(norm_match) \
+                        + "|" + kw_rows[cols_lower.get("campaign name (informational only)", cols_lower.get("campaign name", ent))].astype(str)
+        df["_k"] = df["kw_norm"] + "|" + df["match_norm"] + "|" + df["campaign"].astype(str)
+        action_map = df.set_index("_k")[["조치", "제안입찰가"]].to_dict("index")
+
+        out_rows = []
+        for _, r in kw_rows.iterrows():
+            a = action_map.get(r["_k"])
+            if not a:
+                continue
+            row = r.drop("_k").to_dict()
+            row["Operation"] = "Update"
+            if "일시중지" in a["조치"]:
+                row[cols_lower.get("state", "State")] = "paused"
+                out_rows.append(row)
+            elif a["제안입찰가"]:
+                row[cols_lower.get("bid", "Bid")] = a["제안입찰가"]
+                out_rows.append(row)
+        if out_rows:
+            out_df = pd.DataFrame(out_rows)
+            import io
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                out_df.to_excel(w, sheet_name="Sponsored Products Campaigns", index=False)
+            st.download_button("⬇️ 재업로드용 벌크시트 (xlsx)", buf.getvalue(),
+                               "bulk_reupload.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption(f"{len(out_df)}개 행 — 광고 콘솔 > 벌크 작업 > 업로드에 그대로 올리면 적용됩니다. 업로드 전 내용 한번 확인하세요.")
+        else:
+            st.info("변경 대상이 없습니다.")
+    else:
+        st.info("타겟팅 리포트에는 Keyword ID가 없어 재업로드 시트는 생성되지 않습니다. 벌크파일을 올리면 자동 생성됩니다.")
+
+
+# ─────────────────────────────────────────────
+# 7. Dayparting (시간대별 보고서 분석)
+# ─────────────────────────────────────────────
+def render_dayparting_tab():
+    st.header("🕐 Dayparting 분석")
+    st.caption("광고 콘솔 > 보고서 > '시간대별 캠페인 성과' 리포트를 올리면 시간대별 효율을 분석하고 입찰 조정 스케줄을 제안합니다.")
+
+    up = st.file_uploader("시간대별 보고서 업로드", type=["xlsx", "csv"], key="hourly")
+    if up is None:
+        st.info("시간(Hour) 컬럼이 포함된 리포트가 필요합니다. 일반 타겟팅 리포트는 일 단위라 dayparting 분석이 불가능합니다.")
+        return
+    try:
+        dfh = pd.read_csv(up) if up.name.endswith(".csv") else pd.read_excel(up)
+    except Exception as e:
+        st.error(f"파일 읽기 실패: {e}")
+        return
+
+    lower = {c.lower().strip(): c for c in dfh.columns}
+    hour_col = next((lower[a] for a in ["hour", "start time", "시간", "시간대"] if a in lower), None)
+    if hour_col is None:
+        st.error("시간(Hour) 컬럼을 찾지 못했습니다. 시간대별 보고서인지 확인해주세요.")
+        st.write("발견된 컬럼:", list(dfh.columns))
+        return
+
+    def find(aliases, default=0):
+        for a in aliases:
+            if a in lower:
+                return pd.to_numeric(dfh[lower[a]], errors="coerce").fillna(0)
+        return pd.Series(default, index=dfh.index)
+
+    h = pd.DataFrame({
+        "hour": pd.to_numeric(dfh[hour_col].astype(str).str.extract(r"(\d{1,2})")[0], errors="coerce"),
+        "impressions": find(["impressions", "노출수"]),
+        "clicks": find(["clicks", "클릭수"]),
+        "spend": find(["spend", "cost", "광고비"]),
+        "sales": find(["sales", "7 day total sales", "14 day total sales", "매출"]),
+        "orders": find(["orders", "7 day total orders (#)", "주문수"]),
+    }).dropna(subset=["hour"])
+    h["hour"] = h["hour"].astype(int)
+
+    agg = h.groupby("hour").sum(numeric_only=True).reindex(range(24), fill_value=0)
+    agg["acos"] = agg.apply(lambda r: r["spend"]/r["sales"] if r["sales"] > 0 else None, axis=1)
+    agg["cvr"] = agg.apply(lambda r: r["orders"]/r["clicks"] if r["clicks"] > 0 else None, axis=1)
+
+    st.subheader("시간대별 지출 vs 매출")
+    st.bar_chart(agg[["spend", "sales"]])
+    st.subheader("시간대별 ACOS")
+    st.line_chart(agg["acos"])
+
+    # 추천 로직: 지출 비중 2% 이상인 시간대 중 ACOS 기준 분류
+    valid = agg[agg["spend"] > agg["spend"].sum() * 0.02]
+    med = valid["acos"].median()
+    recs = []
+    for hr, r in agg.iterrows():
+        if r["spend"] == 0:
+            continue
+        share = r["spend"] / agg["spend"].sum()
+        if r["sales"] == 0 and share > 0.02:
+            recs.append({"시간대": f"{hr:02d}:00", "제안": "입찰 -50% 또는 예산 차단",
+                         "근거": f"지출 ${r['spend']:.0f}, 매출 $0"})
+        elif r["acos"] and med and r["acos"] > med * 1.5:
+            recs.append({"시간대": f"{hr:02d}:00", "제안": "입찰 -30%",
+                         "근거": f"ACOS {r['acos']*100:.0f}% (중앙값의 1.5배 초과)"})
+        elif r["acos"] and med and r["acos"] < med * 0.6 and r["orders"] >= 2:
+            recs.append({"시간대": f"{hr:02d}:00", "제안": "입찰 +20%",
+                         "근거": f"ACOS {r['acos']*100:.0f}% — 효율 최상 구간"})
+    st.subheader("📋 시간대별 입찰 조정 제안")
+    if recs:
+        rec_df = pd.DataFrame(recs)
+        st.dataframe(rec_df, use_container_width=True)
+        st.download_button("Dayparting 스케줄 CSV", rec_df.to_csv(index=False).encode("utf-8-sig"),
+                           "dayparting_schedule.csv", "text/csv")
+        st.caption("⚠️ 아마존 SP에는 네이티브 dayparting이 없습니다. 이 스케줄은 자동화 스크립트(예: Playwright 봇)의 입력값이나 수동 규칙으로 활용하세요. 시간대는 리포트 기준 타임존(보통 계정 타임존 = PT)입니다.")
+    else:
+        st.success("뚜렷한 시간대별 비효율이 없습니다. 현 상태 유지 권장.")
+
+
+# ─────────────────────────────────────────────
+# 8. 메인: 탭 구조
 # ─────────────────────────────────────────────
 def main():
-    st.set_page_config(page_title="키워드 중복 탐지", page_icon="🔍", layout="wide")
-    st.title("🔍 아마존 PPC 키워드 중복 탐지 & 그루핑 가이드")
-    st.caption("벌크파일(xlsx) 또는 타겟팅 리포트(xlsx/csv)를 올리면 자동 분석합니다.")
+    st.set_page_config(page_title="PPC 옵티마이저", page_icon="⚙️", layout="wide")
+    st.title("⚙️ 아마존 PPC 옵티마이저")
 
-    up = st.file_uploader("파일 업로드", type=["xlsx", "csv"])
-    if up is None:
-        st.info("👆 아마존 광고 콘솔 → 벌크 작업 → 벌크파일 다운로드 후 그대로 올려주세요.")
-        return
+    up = st.file_uploader("벌크파일(xlsx) 또는 타겟팅 리포트(xlsx/csv) 업로드", type=["xlsx", "csv"])
+    df_raw = None
+    if up is not None:
+        try:
+            if up.name.endswith(".csv"):
+                df_raw = pd.read_csv(up)
+            else:
+                xls = pd.ExcelFile(up)
+                sheet = next((s for s in xls.sheet_names if "sponsored products" in s.lower()),
+                             xls.sheet_names[0])
+                if len(xls.sheet_names) > 1:
+                    sheet = st.selectbox("시트 선택", xls.sheet_names,
+                                         index=xls.sheet_names.index(sheet))
+                df_raw = pd.read_excel(xls, sheet_name=sheet)
+        except Exception as e:
+            st.error(f"파일을 읽지 못했습니다: {e}")
 
-    try:
-        if up.name.endswith(".csv"):
-            df_raw = pd.read_csv(up)
+    tab1, tab2, tab3 = st.tabs(["🔍 중복 탐지 & 그루핑", "⚙️ 최적화 시트", "🕐 Dayparting"])
+    with tab1:
+        if df_raw is not None:
+            render_duplicate_tab(df_raw)
         else:
-            xls = pd.ExcelFile(up)
-            # 벌크파일이면 'Sponsored Products Campaigns' 시트 자동 선택
-            sheet = next((s for s in xls.sheet_names if "sponsored products" in s.lower()),
-                         xls.sheet_names[0])
-            if len(xls.sheet_names) > 1:
-                sheet = st.selectbox("시트 선택", xls.sheet_names,
-                                     index=xls.sheet_names.index(sheet))
-            df_raw = pd.read_excel(xls, sheet_name=sheet)
-    except Exception as e:
-        st.error(f"파일을 읽지 못했습니다: {e}")
-        return
-
-    render_duplicate_tab(df_raw)
+            st.info("👆 상단에서 파일을 먼저 업로드해주세요.")
+    with tab2:
+        if df_raw is not None:
+            render_optimizer_tab(df_raw, df_raw)
+        else:
+            st.info("👆 상단에서 파일을 먼저 업로드해주세요. 벌크파일을 올리면 재업로드용 시트까지 생성됩니다.")
+    with tab3:
+        render_dayparting_tab()
 
 
 if __name__ == "__main__":
